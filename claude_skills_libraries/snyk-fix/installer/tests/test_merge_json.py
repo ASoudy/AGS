@@ -1,0 +1,1315 @@
+"""Unit tests for installer/lib/merge_json.py."""
+
+import json
+import os
+
+import pytest
+from helpers import read_json
+from merge_json import (
+    STRATEGIES,
+    _backup,
+    _command_launcher,
+    _command_script_key,
+    _is_snyk_command,
+    _load_json,
+    _load_toml,
+    _write_json,
+    _write_toml,
+    main,
+    merge_claude_settings,
+    merge_codex_config,
+    merge_cursor_hooks,
+    merge_gemini_settings,
+    merge_mcp_servers,
+    unmerge_claude_settings,
+    unmerge_codex_config,
+    unmerge_cursor_hooks,
+    unmerge_gemini_settings,
+    unmerge_mcp_servers,
+    verify_claude_settings,
+    verify_codex_config,
+    verify_cursor_hooks,
+    verify_gemini_settings,
+    verify_mcp_servers,
+)
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Helper functions
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestLoadJson:
+    def test_returns_dict_from_valid_file(self, tmp_path):
+        p = tmp_path / "data.json"
+        p.write_text('{"key": "value"}')
+        assert _load_json(str(p)) == {"key": "value"}
+
+    def test_returns_empty_dict_for_missing_file(self, tmp_path):
+        assert _load_json(str(tmp_path / "nope.json")) == {}
+
+    def test_raises_on_invalid_json(self, tmp_path):
+        p = tmp_path / "bad.json"
+        p.write_text("not json{{{")
+        with pytest.raises(json.JSONDecodeError):
+            _load_json(str(p))
+
+
+class TestBackup:
+    def test_creates_bak_file(self, tmp_path):
+        p = tmp_path / "file.json"
+        p.write_text('{"a": 1}')
+        _backup(str(p))
+        bak = tmp_path / "file.json.bak"
+        assert bak.exists()
+        assert bak.read_text() == '{"a": 1}'
+
+    def test_noop_for_missing_file(self, tmp_path):
+        _backup(str(tmp_path / "nope.json"))
+        assert not (tmp_path / "nope.json.bak").exists()
+
+    def test_overwrites_existing_bak(self, tmp_path):
+        p = tmp_path / "file.json"
+        p.write_text("original")
+        _backup(str(p))
+        p.write_text("updated")
+        _backup(str(p))
+        assert (tmp_path / "file.json.bak").read_text() == "updated"
+
+
+class TestWriteJson:
+    def test_pretty_prints_with_trailing_newline(self, tmp_path):
+        p = str(tmp_path / "out.json")
+        _write_json(p, {"a": 1})
+        raw = open(p).read()
+        assert raw == '{\n  "a": 1\n}\n'
+
+    def test_creates_parent_directories(self, tmp_path):
+        p = str(tmp_path / "a" / "b" / "c" / "out.json")
+        _write_json(p, {"x": True})
+        assert os.path.isfile(p)
+
+    def test_overwrites_existing(self, tmp_path):
+        p = str(tmp_path / "out.json")
+        _write_json(p, {"first": True})
+        _write_json(p, {"second": True})
+        assert read_json(p) == {"second": True}
+
+
+class TestIsSnykCommand:
+    def test_positive(self):
+        assert _is_snyk_command("python3 snyk_hook.py") is True
+
+    def test_case_insensitive(self):
+        assert _is_snyk_command("SNYK_TOOL") is True
+
+    def test_negative(self):
+        assert _is_snyk_command("eslint --fix") is False
+
+    def test_empty_string(self):
+        assert _is_snyk_command("") is False
+
+
+class TestCommandScriptKeyAndLauncher:
+    """Redirect-aware script identity (options 1 + 2 in merge_json)."""
+
+    def test_script_key_ignores_trailing_redirect_and_log(self):
+        cmd = (
+            "uv run $GEMINI_PROJECT_DIR/.gemini/hooks/snyk_secure_at_inception.py "
+            ">> $GEMINI_PROJECT_DIR/.gemini/hooks/snyk_secure_at_inception.log"
+        )
+        key = _command_script_key(cmd)
+        assert key is not None
+        assert key.endswith("snyk_secure_at_inception.py")
+        assert "snyk_secure_at_inception.log" not in key
+
+    def test_launcher_excludes_script_not_log_with_redirect(self):
+        cmd = (
+            'uv run "/proj/.gemini/hooks/snyk_secure_at_inception.py" '
+            '>> "/proj/.gemini/hooks/out.log"'
+        )
+        assert _command_launcher(cmd) == "uv run"
+
+    def test_legacy_launcher_python3_with_redirect(self):
+        cmd = (
+            'python3 "$HOME/.cursor/hooks/snyk_secure_at_inception.py" '
+            '>> "$HOME/.cursor/hooks/scan.log"'
+        )
+        assert _command_launcher(cmd) == "python3"
+        assert _command_script_key(cmd).endswith("snyk_secure_at_inception.py")
+
+    def test_merge_replaces_legacy_when_target_has_redirect(self, write_json, snyk_cursor_source):
+        target = write_json(
+            "target.json",
+            {
+                "version": 1,
+                "hooks": {
+                    "afterFileEdit": [
+                        {
+                            "command": (
+                                'python3 "$HOME/.cursor/hooks/snyk_secure_at_inception.py" '
+                                '>> "$HOME/.cursor/hooks/snyk_secure_at_inception.log"'
+                            )
+                        }
+                    ]
+                },
+            },
+        )
+        merge_cursor_hooks(target, snyk_cursor_source)
+        after_edit = read_json(target)["hooks"]["afterFileEdit"]
+        assert len(after_edit) == 1
+        assert after_edit[0]["command"] == (
+            'uv run "$HOME/.cursor/hooks/snyk_secure_at_inception.py"'
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# merge_cursor_hooks
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestMergeCursorHooks:
+    def test_merge_into_empty_target(self, empty_target, snyk_cursor_source):
+        merge_cursor_hooks(empty_target, snyk_cursor_source)
+        result = read_json(empty_target)
+        assert result["version"] == 1
+        assert len(result["hooks"]["afterFileEdit"]) == 1
+        assert len(result["hooks"]["stop"]) == 1
+
+    def test_merge_preserves_existing_hooks(self, existing_cursor_target, snyk_cursor_source):
+        merge_cursor_hooks(existing_cursor_target, snyk_cursor_source)
+        result = read_json(existing_cursor_target)
+        commands = [e["command"] for e in result["hooks"]["afterFileEdit"]]
+        assert "eslint --fix" in commands
+        assert any("snyk" in c for c in commands)
+
+    def test_merge_is_idempotent(self, empty_target, snyk_cursor_source):
+        merge_cursor_hooks(empty_target, snyk_cursor_source)
+        merge_cursor_hooks(empty_target, snyk_cursor_source)
+        result = read_json(empty_target)
+        assert len(result["hooks"]["afterFileEdit"]) == 1
+        assert len(result["hooks"]["stop"]) == 1
+
+    def test_merge_preserves_existing_version(self, write_json, snyk_cursor_source):
+        target = write_json("target.json", {"version": 2, "hooks": {}})
+        merge_cursor_hooks(target, snyk_cursor_source)
+        assert read_json(target)["version"] == 2
+
+    def test_merge_adds_new_event_types(self, write_json, snyk_cursor_source):
+        target = write_json(
+            "target.json",
+            {"version": 1, "hooks": {"beforeCommand": [{"command": "echo hi"}]}},
+        )
+        merge_cursor_hooks(target, snyk_cursor_source)
+        result = read_json(target)
+        assert "beforeCommand" in result["hooks"]
+        assert "afterFileEdit" in result["hooks"]
+        assert "stop" in result["hooks"]
+
+    def test_merge_creates_backup(self, existing_cursor_target, snyk_cursor_source):
+        merge_cursor_hooks(existing_cursor_target, snyk_cursor_source)
+        assert os.path.isfile(existing_cursor_target + ".bak")
+
+    def test_merge_with_empty_source(self, write_json, existing_cursor_target):
+        source = write_json("source.json", {})
+        original = read_json(existing_cursor_target)
+        merge_cursor_hooks(existing_cursor_target, source)
+        result = read_json(existing_cursor_target)
+        assert result["hooks"] == original["hooks"]
+
+    def test_merge_dedup_by_command_only(self, write_json, snyk_cursor_source):
+        target = write_json(
+            "target.json",
+            {
+                "version": 1,
+                "hooks": {
+                    "afterFileEdit": [
+                        {
+                            "command": 'uv run "$HOME/.cursor/hooks/snyk_secure_at_inception.py"',
+                            "extra_field": "different",
+                        }
+                    ]
+                },
+            },
+        )
+        merge_cursor_hooks(target, snyk_cursor_source)
+        assert len(read_json(target)["hooks"]["afterFileEdit"]) == 1
+
+    def test_merge_replaces_legacy_launcher(self, write_json, snyk_cursor_source):
+        target = write_json(
+            "target.json",
+            {
+                "version": 1,
+                "hooks": {
+                    "afterFileEdit": [
+                        {"command": 'python "$HOME/.cursor/hooks/snyk_secure_at_inception.py"'}
+                    ]
+                },
+            },
+        )
+        merge_cursor_hooks(target, snyk_cursor_source)
+        after_edit = read_json(target)["hooks"]["afterFileEdit"]
+        assert len(after_edit) == 1
+        assert after_edit[0]["command"] == (
+            'uv run "$HOME/.cursor/hooks/snyk_secure_at_inception.py"'
+        )
+
+    def test_merge_replaces_legacy_python3_launcher(self, write_json, snyk_cursor_source):
+        target = write_json(
+            "target.json",
+            {
+                "version": 1,
+                "hooks": {
+                    "afterFileEdit": [
+                        {"command": 'python3 "$HOME/.cursor/hooks/snyk_secure_at_inception.py"'}
+                    ]
+                },
+            },
+        )
+        merge_cursor_hooks(target, snyk_cursor_source)
+        after_edit = read_json(target)["hooks"]["afterFileEdit"]
+        assert len(after_edit) == 1
+        assert after_edit[0]["command"] == (
+            'uv run "$HOME/.cursor/hooks/snyk_secure_at_inception.py"'
+        )
+
+    def test_merge_does_not_replace_non_legacy_launcher(self, write_json, snyk_cursor_source):
+        target = write_json(
+            "target.json",
+            {
+                "version": 1,
+                "hooks": {
+                    "afterFileEdit": [
+                        {"command": 'cat "$HOME/.cursor/hooks/snyk_secure_at_inception.py"'}
+                    ]
+                },
+            },
+        )
+        merge_cursor_hooks(target, snyk_cursor_source)
+        after_edit = read_json(target)["hooks"]["afterFileEdit"]
+        commands = [e["command"] for e in after_edit]
+        assert 'cat "$HOME/.cursor/hooks/snyk_secure_at_inception.py"' in commands
+        assert 'uv run "$HOME/.cursor/hooks/snyk_secure_at_inception.py"' in commands
+
+    def test_merge_no_backup_for_new_target(self, empty_target, snyk_cursor_source):
+        merge_cursor_hooks(empty_target, snyk_cursor_source)
+        assert not os.path.isfile(empty_target + ".bak")
+
+    def test_merge_fails_on_invalid_json(self, tmp_path, snyk_cursor_source):
+        target = tmp_path / "target.json"
+        target.write_text("{ invalid }")
+        with pytest.raises(ValueError, match="Invalid JSON in file"):
+            merge_cursor_hooks(str(target), snyk_cursor_source)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# merge_claude_settings
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestMergeClaudeSettings:
+    def test_merge_into_empty_target(self, empty_target, snyk_claude_source):
+        merge_claude_settings(empty_target, snyk_claude_source)
+        result = read_json(empty_target)
+        assert "PostToolUse" in result["hooks"]
+        assert "Stop" in result["hooks"]
+
+    def test_merge_into_matching_group(self, existing_claude_target, snyk_claude_source):
+        merge_claude_settings(existing_claude_target, snyk_claude_source)
+        result = read_json(existing_claude_target)
+        # The Edit|Write group should have both prettier and snyk hooks
+        groups = result["hooks"]["PostToolUse"]
+        edit_write_group = next(g for g in groups if g.get("matcher") == "Edit|Write")
+        commands = [h["command"] for h in edit_write_group["hooks"]]
+        assert "prettier --write" in commands
+        assert any("snyk" in c for c in commands)
+
+    def test_merge_appends_new_group(self, write_json, snyk_claude_source):
+        target = write_json(
+            "target.json",
+            {
+                "hooks": {
+                    "PostToolUse": [
+                        {
+                            "matcher": "Bash",
+                            "hooks": [{"type": "command", "command": "logger"}],
+                        }
+                    ]
+                }
+            },
+        )
+        merge_claude_settings(target, snyk_claude_source)
+        result = read_json(target)
+        matchers = [g.get("matcher") for g in result["hooks"]["PostToolUse"]]
+        assert "Bash" in matchers
+        assert "Edit|Write" in matchers
+
+    def test_merge_is_idempotent(self, empty_target, snyk_claude_source):
+        merge_claude_settings(empty_target, snyk_claude_source)
+        merge_claude_settings(empty_target, snyk_claude_source)
+        result = read_json(empty_target)
+        edit_group = result["hooks"]["PostToolUse"][0]
+        assert len(edit_group["hooks"]) == 1
+
+    def test_merge_handles_no_matcher_group(self, empty_target, snyk_claude_source):
+        merge_claude_settings(empty_target, snyk_claude_source)
+        result = read_json(empty_target)
+        # Stop event has a group with no matcher key
+        stop_groups = result["hooks"]["Stop"]
+        assert len(stop_groups) == 1
+        assert "matcher" not in stop_groups[0]
+
+    def test_merge_preserves_non_hooks_settings(self, existing_claude_target, snyk_claude_source):
+        merge_claude_settings(existing_claude_target, snyk_claude_source)
+        result = read_json(existing_claude_target)
+        assert result["allowedTools"] == ["Read", "Write"]
+
+    def test_merge_multiple_events(self, empty_target, snyk_claude_source):
+        merge_claude_settings(empty_target, snyk_claude_source)
+        result = read_json(empty_target)
+        assert "PostToolUse" in result["hooks"]
+        assert "Stop" in result["hooks"]
+
+    def test_merge_creates_backup(self, existing_claude_target, snyk_claude_source):
+        merge_claude_settings(existing_claude_target, snyk_claude_source)
+        assert os.path.isfile(existing_claude_target + ".bak")
+
+    def test_merge_replaces_matching_script_hook_launcher(self, write_json, snyk_claude_source):
+        target = write_json(
+            "target.json",
+            {
+                "hooks": {
+                    "PostToolUse": [
+                        {
+                            "matcher": "Edit|Write",
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": 'python "$HOME/.claude/hooks/snyk_secure_at_inception.py"',
+                                    "statusMessage": "old",
+                                }
+                            ],
+                        }
+                    ]
+                }
+            },
+        )
+        merge_claude_settings(target, snyk_claude_source)
+        hooks = read_json(target)["hooks"]["PostToolUse"][0]["hooks"]
+        assert len(hooks) == 1
+        assert hooks[0]["command"] == ('uv run "$HOME/.claude/hooks/snyk_secure_at_inception.py"')
+        assert hooks[0]["statusMessage"] == "Tracking code changes for security scan..."
+
+    def test_merge_replaces_legacy_python3_hook_launcher(self, write_json, snyk_claude_source):
+        target = write_json(
+            "target.json",
+            {
+                "hooks": {
+                    "PostToolUse": [
+                        {
+                            "matcher": "Edit|Write",
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": 'python3 "$HOME/.claude/hooks/snyk_secure_at_inception.py"',
+                                    "statusMessage": "old",
+                                }
+                            ],
+                        }
+                    ]
+                }
+            },
+        )
+        merge_claude_settings(target, snyk_claude_source)
+        hooks = read_json(target)["hooks"]["PostToolUse"][0]["hooks"]
+        assert len(hooks) == 1
+        assert hooks[0]["command"] == ('uv run "$HOME/.claude/hooks/snyk_secure_at_inception.py"')
+
+    def test_merge_fails_on_invalid_json(self, tmp_path, snyk_claude_source):
+        target = tmp_path / "target.json"
+        target.write_text("{ invalid }")
+        with pytest.raises(ValueError, match="Invalid JSON in file"):
+            merge_claude_settings(str(target), snyk_claude_source)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# merge_mcp_servers
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestMergeMcpServers:
+    def test_merge_into_empty_target(self, empty_target, snyk_mcp_source):
+        merge_mcp_servers(empty_target, snyk_mcp_source)
+        result = read_json(empty_target)
+        assert "Snyk" in result["mcpServers"]
+        assert result["mcpServers"]["Snyk"]["command"] == "npx"
+
+    def test_merge_preserves_non_snyk_servers(self, existing_mcp_target, snyk_mcp_source):
+        merge_mcp_servers(existing_mcp_target, snyk_mcp_source)
+        result = read_json(existing_mcp_target)
+        assert "GitHub" in result["mcpServers"]
+        assert "Snyk" in result["mcpServers"]
+
+    def test_merge_overwrites_existing_snyk(self, write_json, snyk_mcp_source):
+        target = write_json(
+            "target.json",
+            {
+                "mcpServers": {
+                    "Snyk": {"command": "old-snyk", "args": ["--old"]},
+                }
+            },
+        )
+        merge_mcp_servers(target, snyk_mcp_source)
+        result = read_json(target)
+        assert result["mcpServers"]["Snyk"]["command"] == "npx"
+        assert result["mcpServers"]["Snyk"]["args"] == [
+            "-y",
+            "snyk@latest",
+            "mcp",
+            "-t",
+            "stdio",
+        ]
+
+    def test_merge_multiple_snyk_servers(self, empty_target, multi_snyk_mcp_source):
+        merge_mcp_servers(empty_target, multi_snyk_mcp_source)
+        result = read_json(empty_target)
+        assert "Snyk" in result["mcpServers"]
+        assert "SnykCode" in result["mcpServers"]
+
+    def test_merge_multiple_with_preexisting(self, existing_mcp_target, multi_snyk_mcp_source):
+        merge_mcp_servers(existing_mcp_target, multi_snyk_mcp_source)
+        result = read_json(existing_mcp_target)
+        assert "GitHub" in result["mcpServers"]
+        assert "Snyk" in result["mcpServers"]
+        assert "SnykCode" in result["mcpServers"]
+
+    def test_merge_is_idempotent(self, existing_mcp_target, snyk_mcp_source):
+        merge_mcp_servers(existing_mcp_target, snyk_mcp_source)
+        first = read_json(existing_mcp_target)
+        merge_mcp_servers(existing_mcp_target, snyk_mcp_source)
+        second = read_json(existing_mcp_target)
+        assert first == second
+
+    def test_merge_creates_backup(self, existing_mcp_target, snyk_mcp_source):
+        merge_mcp_servers(existing_mcp_target, snyk_mcp_source)
+        assert os.path.isfile(existing_mcp_target + ".bak")
+
+    def test_merge_preserves_full_server_config(self, empty_target, snyk_mcp_source):
+        merge_mcp_servers(empty_target, snyk_mcp_source)
+        snyk = read_json(empty_target)["mcpServers"]["Snyk"]
+        assert snyk["command"] == "npx"
+        assert snyk["args"] == ["-y", "snyk@latest", "mcp", "-t", "stdio"]
+        assert snyk["env"] == {"SNYK_MCP_PROFILE": "experimental"}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# unmerge_cursor_hooks
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestUnmergeCursorHooks:
+    def test_removes_matching_commands(self, write_json, snyk_cursor_source):
+        target = write_json(
+            "target.json",
+            {
+                "version": 1,
+                "hooks": {
+                    "afterFileEdit": [
+                        {"command": "eslint --fix"},
+                        {"command": 'uv run "$HOME/.cursor/hooks/snyk_secure_at_inception.py"'},
+                    ],
+                    "stop": [
+                        {"command": 'uv run "$HOME/.cursor/hooks/snyk_secure_at_inception.py"'},
+                    ],
+                },
+            },
+        )
+        unmerge_cursor_hooks(target, snyk_cursor_source)
+        result = read_json(target)
+        assert len(result["hooks"]["afterFileEdit"]) == 1
+        assert result["hooks"]["afterFileEdit"][0]["command"] == "eslint --fix"
+
+    def test_cleans_empty_events(self, write_json, snyk_cursor_source):
+        target = write_json(
+            "target.json",
+            {
+                "version": 1,
+                "hooks": {
+                    "stop": [
+                        {"command": 'uv run "$HOME/.cursor/hooks/snyk_secure_at_inception.py"'},
+                    ],
+                },
+            },
+        )
+        unmerge_cursor_hooks(target, snyk_cursor_source)
+        result = read_json(target)
+        assert "stop" not in result["hooks"]
+
+    def test_noop_missing_target(self, tmp_path, snyk_cursor_source):
+        target = str(tmp_path / "nope.json")
+        unmerge_cursor_hooks(target, snyk_cursor_source)
+        assert not os.path.exists(target)
+
+    def test_noop_commands_absent(self, write_json, snyk_cursor_source):
+        target = write_json(
+            "target.json",
+            {
+                "version": 1,
+                "hooks": {"afterFileEdit": [{"command": "eslint --fix"}]},
+            },
+        )
+        original = read_json(target)
+        unmerge_cursor_hooks(target, snyk_cursor_source)
+        result = read_json(target)
+        assert result["hooks"] == original["hooks"]
+
+    def test_noop_no_hooks_key(self, write_json, snyk_cursor_source):
+        target = write_json("target.json", {"version": 1})
+        unmerge_cursor_hooks(target, snyk_cursor_source)
+        assert read_json(target) == {"version": 1}
+
+    def test_noop_empty_source(self, write_json, existing_cursor_target):
+        source = write_json("source.json", {})
+        original = read_json(existing_cursor_target)
+        unmerge_cursor_hooks(existing_cursor_target, source)
+        assert read_json(existing_cursor_target) == original
+
+    def test_preserves_other_events(self, write_json, snyk_cursor_source):
+        target = write_json(
+            "target.json",
+            {
+                "version": 1,
+                "hooks": {
+                    "afterFileEdit": [
+                        {"command": 'uv run "$HOME/.cursor/hooks/snyk_secure_at_inception.py"'},
+                    ],
+                    "beforeCommand": [{"command": "echo hi"}],
+                },
+            },
+        )
+        unmerge_cursor_hooks(target, snyk_cursor_source)
+        result = read_json(target)
+        assert "beforeCommand" in result["hooks"]
+        assert len(result["hooks"]["beforeCommand"]) == 1
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# unmerge_claude_settings
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestUnmergeClaudeSettings:
+    def _merged_target(self, write_json, snyk_claude_source):
+        """Helper: create a target with both prettier and snyk hooks merged."""
+        target = write_json(
+            "target.json",
+            {
+                "allowedTools": ["Read"],
+                "hooks": {
+                    "PostToolUse": [
+                        {
+                            "matcher": "Edit|Write",
+                            "hooks": [
+                                {"type": "command", "command": "prettier --write"},
+                                {
+                                    "type": "command",
+                                    "command": 'uv run "$HOME/.claude/hooks/snyk_secure_at_inception.py"',
+                                },
+                            ],
+                        }
+                    ],
+                    "Stop": [
+                        {
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": 'uv run "$HOME/.claude/hooks/snyk_secure_at_inception.py"',
+                                }
+                            ]
+                        }
+                    ],
+                },
+            },
+        )
+        return target
+
+    def test_removes_matching_commands(self, write_json, snyk_claude_source):
+        target = self._merged_target(write_json, snyk_claude_source)
+        unmerge_claude_settings(target, snyk_claude_source)
+        result = read_json(target)
+        group = result["hooks"]["PostToolUse"][0]
+        assert len(group["hooks"]) == 1
+        assert group["hooks"][0]["command"] == "prettier --write"
+
+    def test_removes_empty_groups(self, write_json, snyk_claude_source):
+        target = write_json(
+            "target.json",
+            {
+                "hooks": {
+                    "PostToolUse": [
+                        {
+                            "matcher": "Edit|Write",
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": 'uv run "$HOME/.claude/hooks/snyk_secure_at_inception.py"',
+                                }
+                            ],
+                        }
+                    ],
+                }
+            },
+        )
+        unmerge_claude_settings(target, snyk_claude_source)
+        result = read_json(target)
+        # The Edit|Write group should be removed since its hooks are empty
+        assert "PostToolUse" not in result["hooks"]
+
+    def test_removes_empty_events(self, write_json, snyk_claude_source):
+        target = write_json(
+            "target.json",
+            {
+                "hooks": {
+                    "Stop": [
+                        {
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": 'uv run "$HOME/.claude/hooks/snyk_secure_at_inception.py"',
+                                }
+                            ]
+                        }
+                    ]
+                }
+            },
+        )
+        unmerge_claude_settings(target, snyk_claude_source)
+        result = read_json(target)
+        assert "Stop" not in result["hooks"]
+
+    def test_noop_missing_target(self, tmp_path, snyk_claude_source):
+        target = str(tmp_path / "nope.json")
+        unmerge_claude_settings(target, snyk_claude_source)
+        assert not os.path.exists(target)
+
+    def test_noop_commands_absent(self, write_json, snyk_claude_source):
+        target = write_json(
+            "target.json",
+            {
+                "hooks": {
+                    "PostToolUse": [
+                        {
+                            "matcher": "Edit|Write",
+                            "hooks": [{"type": "command", "command": "prettier --write"}],
+                        }
+                    ]
+                }
+            },
+        )
+        read_json(target)
+        unmerge_claude_settings(target, snyk_claude_source)
+        # prettier should still be there
+        result = read_json(target)
+        assert len(result["hooks"]["PostToolUse"][0]["hooks"]) == 1
+
+    def test_preserves_non_hooks_settings(self, write_json, snyk_claude_source):
+        target = self._merged_target(write_json, snyk_claude_source)
+        unmerge_claude_settings(target, snyk_claude_source)
+        result = read_json(target)
+        assert result["allowedTools"] == ["Read"]
+
+    def test_handles_no_matcher_group(self, write_json, snyk_claude_source):
+        """Stop event has groups with no matcher — unmerge should match on None."""
+        target = write_json(
+            "target.json",
+            {
+                "hooks": {
+                    "Stop": [
+                        {
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": 'uv run "$HOME/.claude/hooks/snyk_secure_at_inception.py"',
+                                },
+                                {"type": "command", "command": "echo done"},
+                            ]
+                        }
+                    ]
+                }
+            },
+        )
+        unmerge_claude_settings(target, snyk_claude_source)
+        result = read_json(target)
+        group = result["hooks"]["Stop"][0]
+        assert len(group["hooks"]) == 1
+        assert group["hooks"][0]["command"] == "echo done"
+
+    def test_noop_empty_source(self, write_json, existing_claude_target):
+        source = write_json("source.json", {})
+        original = read_json(existing_claude_target)
+        unmerge_claude_settings(existing_claude_target, source)
+        assert read_json(existing_claude_target) == original
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# unmerge_mcp_servers
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestUnmergeMcpServers:
+    def test_removes_matching_servers(self, write_json, snyk_mcp_source):
+        target = write_json(
+            "target.json",
+            {
+                "mcpServers": {
+                    "GitHub": {"command": "gh", "args": ["mcp"]},
+                    "Snyk": {"command": "npx", "args": ["snyk@latest"]},
+                }
+            },
+        )
+        unmerge_mcp_servers(target, snyk_mcp_source)
+        result = read_json(target)
+        assert "GitHub" in result["mcpServers"]
+        assert "Snyk" not in result["mcpServers"]
+
+    def test_removes_multiple_snyk_servers(self, write_json, multi_snyk_mcp_source):
+        target = write_json(
+            "target.json",
+            {
+                "mcpServers": {
+                    "GitHub": {"command": "gh"},
+                    "Snyk": {"command": "npx"},
+                    "SnykCode": {"command": "npx"},
+                }
+            },
+        )
+        unmerge_mcp_servers(target, multi_snyk_mcp_source)
+        result = read_json(target)
+        assert "GitHub" in result["mcpServers"]
+        assert "Snyk" not in result["mcpServers"]
+        assert "SnykCode" not in result["mcpServers"]
+
+    def test_noop_missing_target(self, tmp_path, snyk_mcp_source):
+        target = str(tmp_path / "nope.json")
+        unmerge_mcp_servers(target, snyk_mcp_source)
+        assert not os.path.exists(target)
+
+    def test_noop_server_absent(self, existing_mcp_target, snyk_mcp_source):
+        original = read_json(existing_mcp_target)
+        unmerge_mcp_servers(existing_mcp_target, snyk_mcp_source)
+        result = read_json(existing_mcp_target)
+        assert result == original
+
+    def test_noop_no_mcpservers_key(self, write_json, snyk_mcp_source):
+        target = write_json("target.json", {"other": "data"})
+        unmerge_mcp_servers(target, snyk_mcp_source)
+        assert read_json(target) == {"other": "data"}
+
+    def test_preserves_non_snyk_servers(self, write_json, multi_snyk_mcp_source):
+        target = write_json(
+            "target.json",
+            {
+                "mcpServers": {
+                    "GitHub": {"command": "gh"},
+                    "Copilot": {"command": "copilot-mcp"},
+                    "Snyk": {"command": "npx"},
+                    "SnykCode": {"command": "npx"},
+                }
+            },
+        )
+        unmerge_mcp_servers(target, multi_snyk_mcp_source)
+        result = read_json(target)
+        assert set(result["mcpServers"].keys()) == {"GitHub", "Copilot"}
+
+    def test_noop_empty_source(self, write_json, existing_mcp_target):
+        source = write_json("source.json", {})
+        original = read_json(existing_mcp_target)
+        unmerge_mcp_servers(existing_mcp_target, source)
+        assert read_json(existing_mcp_target) == original
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# merge_gemini_settings / unmerge / verify
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+SNYK_GEMINI_SETTINGS = {
+    "hooks": {
+        "AfterTool": [
+            {
+                "matcher": "write_file|replace",
+                "hooks": [
+                    {
+                        "name": "snyk_secure_at_inception_after_tool_edit",
+                        "type": "command",
+                        "command": 'python3 "$HOME/.gemini/hooks/snyk_secure_at_inception.py"',
+                        "description": "Scans code changes for vulnerabilities using Snyk",
+                    }
+                ],
+            }
+        ],
+        "AfterAgent": [
+            {
+                "matcher": "*",
+                "hooks": [
+                    {
+                        "name": "snyk_secure_at_inception_after_agent",
+                        "type": "command",
+                        "command": 'python3 "$HOME/.gemini/hooks/snyk_secure_at_inception.py"',
+                        "description": "Evaluate Snyk scan results before agent completes",
+                    }
+                ],
+            }
+        ],
+    }
+}
+
+
+class TestGeminiSettingsStrategies:
+    @pytest.fixture
+    def snyk_gemini_source(self, write_json):
+        return write_json("source/gemini_settings.json", SNYK_GEMINI_SETTINGS)
+
+    def test_merge_into_empty_target(self, empty_target, snyk_gemini_source):
+        merge_gemini_settings(empty_target, snyk_gemini_source)
+        result = read_json(empty_target)
+        assert "AfterTool" in result["hooks"]
+        assert "AfterAgent" in result["hooks"]
+
+    def test_merge_preserves_unrelated_top_level_keys(self, write_json, snyk_gemini_source):
+        target = write_json("target.json", {"theme": "dark", "hooks": {}})
+        merge_gemini_settings(target, snyk_gemini_source)
+        result = read_json(target)
+        assert result["theme"] == "dark"
+        assert "AfterTool" in result["hooks"]
+
+    def test_merge_is_idempotent(self, empty_target, snyk_gemini_source):
+        merge_gemini_settings(empty_target, snyk_gemini_source)
+        merge_gemini_settings(empty_target, snyk_gemini_source)
+        result = read_json(empty_target)
+        for groups in result["hooks"].values():
+            for group in groups:
+                commands = [h["command"] for h in group["hooks"]]
+                assert len(commands) == len(set(commands))
+
+    def test_unmerge_removes_snyk_hooks(self, empty_target, snyk_gemini_source):
+        merge_gemini_settings(empty_target, snyk_gemini_source)
+        unmerge_gemini_settings(empty_target, snyk_gemini_source)
+        result = read_json(empty_target)
+        assert "AfterTool" not in result.get("hooks", {})
+        assert "AfterAgent" not in result.get("hooks", {})
+
+    def test_verify_passes_after_merge(self, empty_target, snyk_gemini_source):
+        merge_gemini_settings(empty_target, snyk_gemini_source)
+        # Should not raise
+        verify_gemini_settings(empty_target, snyk_gemini_source)
+
+    def test_verify_fails_when_missing(self, empty_target, snyk_gemini_source):
+        with pytest.raises(SystemExit):
+            verify_gemini_settings(empty_target, snyk_gemini_source)
+
+    def test_strategies_registered(self):
+        assert "merge_gemini_settings" in STRATEGIES
+        assert "unmerge_gemini_settings" in STRATEGIES
+        assert "verify_gemini_settings" in STRATEGIES
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# main() CLI dispatch
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestMain:
+    def test_dispatches_correctly(self, monkeypatch, empty_target, snyk_mcp_source):
+        monkeypatch.setattr(
+            "sys.argv",
+            ["merge_json.py", "merge_mcp_servers", empty_target, snyk_mcp_source],
+        )
+        main()
+        result = read_json(empty_target)
+        assert "Snyk" in result["mcpServers"]
+
+    def test_exits_wrong_argc(self, monkeypatch):
+        monkeypatch.setattr("sys.argv", ["merge_json.py", "only_one_arg"])
+        with pytest.raises(SystemExit) as exc_info:
+            main()
+        assert exc_info.value.code == 1
+
+    def test_exits_unknown_strategy(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(
+            "sys.argv",
+            ["merge_json.py", "bogus", str(tmp_path / "t"), str(tmp_path / "s")],
+        )
+        with pytest.raises(SystemExit) as exc_info:
+            main()
+        assert exc_info.value.code == 1
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# verify_claude_settings
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestVerifyClaudeSettings:
+    def test_passes_when_hooks_present(self, write_json, snyk_claude_source):
+        """Verify succeeds when all expected hooks are in target."""
+        target = write_json("target.json", {"model": "opus[1m]"})
+        merge_claude_settings(target, snyk_claude_source)
+        # Should not raise SystemExit
+        verify_claude_settings(target, snyk_claude_source)
+
+    def test_fails_when_hooks_missing(self, write_json, snyk_claude_source):
+        """Verify fails when target has no hooks at all."""
+        target = write_json("target.json", {"model": "opus[1m]"})
+        with pytest.raises(SystemExit) as exc_info:
+            verify_claude_settings(target, snyk_claude_source)
+        assert exc_info.value.code == 1
+
+    def test_fails_when_event_missing(self, write_json, snyk_claude_source):
+        """Verify fails when target has PostToolUse but not Stop."""
+        target = write_json(
+            "target.json",
+            {
+                "hooks": {
+                    "PostToolUse": [
+                        {
+                            "matcher": "Edit|Write",
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": 'uv run "$HOME/.claude/hooks/snyk_secure_at_inception.py"',
+                                }
+                            ],
+                        }
+                    ]
+                }
+            },
+        )
+        with pytest.raises(SystemExit) as exc_info:
+            verify_claude_settings(target, snyk_claude_source)
+        assert exc_info.value.code == 1
+
+    def test_fails_when_command_missing(self, write_json, snyk_claude_source):
+        """Verify fails when matcher group exists but command is different."""
+        target = write_json(
+            "target.json",
+            {
+                "hooks": {
+                    "PostToolUse": [
+                        {
+                            "matcher": "Edit|Write",
+                            "hooks": [{"type": "command", "command": "prettier --write"}],
+                        }
+                    ],
+                    "Stop": [{"hooks": [{"type": "command", "command": "echo done"}]}],
+                }
+            },
+        )
+        with pytest.raises(SystemExit) as exc_info:
+            verify_claude_settings(target, snyk_claude_source)
+        assert exc_info.value.code == 1
+
+    def test_passes_with_extra_hooks(self, write_json, snyk_claude_source):
+        """Verify passes when target has expected hooks plus extras."""
+        target = write_json("target.json", {"model": "opus[1m]"})
+        merge_claude_settings(target, snyk_claude_source)
+        # Add extra hooks
+        data = read_json(target)
+        data["hooks"]["PostToolUse"][0]["hooks"].append(
+            {"type": "command", "command": "prettier --write"}
+        )
+        _write_json(target, data)
+        verify_claude_settings(target, snyk_claude_source)
+
+    def test_fails_on_missing_file(self, tmp_path, snyk_claude_source):
+        """Verify fails when target file doesn't exist."""
+        target = str(tmp_path / "nope.json")
+        with pytest.raises(SystemExit) as exc_info:
+            verify_claude_settings(target, snyk_claude_source)
+        assert exc_info.value.code == 1
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# verify_cursor_hooks
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestVerifyCursorHooks:
+    def test_passes_when_hooks_present(self, write_json, snyk_cursor_source):
+        target = write_json("target.json", {})
+        merge_cursor_hooks(target, snyk_cursor_source)
+        verify_cursor_hooks(target, snyk_cursor_source)
+
+    def test_fails_when_hooks_missing(self, write_json, snyk_cursor_source):
+        target = write_json("target.json", {"version": 1, "hooks": {}})
+        with pytest.raises(SystemExit) as exc_info:
+            verify_cursor_hooks(target, snyk_cursor_source)
+        assert exc_info.value.code == 1
+
+    def test_fails_on_missing_file(self, tmp_path, snyk_cursor_source):
+        target = str(tmp_path / "nope.json")
+        with pytest.raises(SystemExit) as exc_info:
+            verify_cursor_hooks(target, snyk_cursor_source)
+        assert exc_info.value.code == 1
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# verify_mcp_servers
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestVerifyMcpServers:
+    def test_passes_when_servers_present(self, write_json, snyk_mcp_source):
+        target = write_json("target.json", {})
+        merge_mcp_servers(target, snyk_mcp_source)
+        verify_mcp_servers(target, snyk_mcp_source)
+
+    def test_fails_when_servers_missing(self, write_json, snyk_mcp_source):
+        target = write_json("target.json", {"mcpServers": {}})
+        with pytest.raises(SystemExit) as exc_info:
+            verify_mcp_servers(target, snyk_mcp_source)
+        assert exc_info.value.code == 1
+
+    def test_fails_on_missing_file(self, tmp_path, snyk_mcp_source):
+        target = str(tmp_path / "nope.json")
+        with pytest.raises(SystemExit) as exc_info:
+            verify_mcp_servers(target, snyk_mcp_source)
+        assert exc_info.value.code == 1
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Codex TOML config: merge / unmerge / verify
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def _read_toml(path):
+    """Helper: read a TOML file into a dict (uses the same reader as merge_json)."""
+    return _load_toml(path)
+
+
+class TestLoadToml:
+    def test_returns_dict_from_valid_file(self, tmp_path):
+        p = tmp_path / "data.toml"
+        p.write_text('key = "value"\n')
+        assert _load_toml(str(p)) == {"key": "value"}
+
+    def test_returns_empty_dict_for_missing_file(self, tmp_path):
+        assert _load_toml(str(tmp_path / "nope.toml")) == {}
+
+
+class TestWriteToml:
+    def test_writes_round_trippable_content(self, tmp_path):
+        p = str(tmp_path / "out.toml")
+        _write_toml(p, {"a": 1, "nested": {"b": True}})
+        assert _load_toml(p) == {"a": 1, "nested": {"b": True}}
+
+    def test_creates_parent_directories(self, tmp_path):
+        p = str(tmp_path / "a" / "b" / "c" / "out.toml")
+        _write_toml(p, {"x": True})
+        assert os.path.exists(p)
+
+
+class TestMergeCodexConfig:
+    """merge_codex_config handles features, hooks, and mcp_servers concerns."""
+
+    def test_creates_target_when_missing(self, tmp_path, snyk_codex_hooks_source):
+        target = str(tmp_path / "config.toml")
+        merge_codex_config(target, snyk_codex_hooks_source)
+        data = _read_toml(target)
+        assert data["features"]["hooks"] is True
+        assert "SessionStart" in data["hooks"]
+        assert "PostToolUse" in data["hooks"]
+        assert "Stop" in data["hooks"]
+
+    def test_preserves_existing_user_keys(self, existing_codex_target, snyk_codex_hooks_source):
+        merge_codex_config(existing_codex_target, snyk_codex_hooks_source)
+        data = _read_toml(existing_codex_target)
+        # User's top-level scalar preserved
+        assert data["model"] == "gpt-5"
+        # User's other [features] flag preserved alongside ours
+        assert data["features"]["my_other_flag"] is True
+        assert data["features"]["hooks"] is True
+        # User's MCP server preserved
+        assert data["mcp_servers"]["GitHub"]["command"] == "gh"
+
+    def test_creates_backup_file(self, existing_codex_target, snyk_codex_hooks_source):
+        merge_codex_config(existing_codex_target, snyk_codex_hooks_source)
+        assert os.path.exists(existing_codex_target + ".bak")
+
+    def test_merges_mcp_servers_alongside_hooks(
+        self, existing_codex_target, snyk_codex_hooks_source, snyk_codex_mcp_source
+    ):
+        merge_codex_config(existing_codex_target, snyk_codex_hooks_source)
+        merge_codex_config(existing_codex_target, snyk_codex_mcp_source)
+        data = _read_toml(existing_codex_target)
+        assert data["mcp_servers"]["Snyk"]["command"] == "npx"
+        assert data["mcp_servers"]["GitHub"]["command"] == "gh"
+        assert data["features"]["hooks"] is True
+        assert "PostToolUse" in data["hooks"]
+
+    def test_idempotent_dedupes_by_command(self, tmp_path, snyk_codex_hooks_source):
+        target = str(tmp_path / "config.toml")
+        merge_codex_config(target, snyk_codex_hooks_source)
+        merge_codex_config(target, snyk_codex_hooks_source)
+        data = _read_toml(target)
+        # Each event has exactly one matcher group with exactly one hook entry
+        for event in ("SessionStart", "PostToolUse", "Stop"):
+            assert len(data["hooks"][event]) == 1
+            assert len(data["hooks"][event][0]["hooks"]) == 1
+
+    def test_appends_when_existing_hook_has_different_matcher(
+        self, write_toml, snyk_codex_hooks_source
+    ):
+        # Pre-existing PostToolUse with a different matcher must coexist with ours.
+        target = write_toml(
+            "config.toml",
+            """
+[[hooks.PostToolUse]]
+matcher = "^(eslint|prettier)$"
+[[hooks.PostToolUse.hooks]]
+type = "command"
+command = "echo lint"
+""",
+        )
+        merge_codex_config(target, snyk_codex_hooks_source)
+        data = _read_toml(target)
+        matchers = sorted(g.get("matcher", "") for g in data["hooks"]["PostToolUse"])
+        assert matchers == ["^(apply_patch|Edit|Write)$", "^(eslint|prettier)$"]
+
+    def test_dedupes_within_same_matcher_group(self, write_toml, snyk_codex_hooks_source):
+        # Existing PostToolUse with the SAME matcher and a different command:
+        # ours appends without removing theirs.
+        target = write_toml(
+            "config.toml",
+            """
+[[hooks.PostToolUse]]
+matcher = "^(apply_patch|Edit|Write)$"
+[[hooks.PostToolUse.hooks]]
+type = "command"
+command = "echo other-tool"
+""",
+        )
+        merge_codex_config(target, snyk_codex_hooks_source)
+        data = _read_toml(target)
+        groups = data["hooks"]["PostToolUse"]
+        assert len(groups) == 1  # Same matcher → single group
+        commands = [h["command"] for h in groups[0]["hooks"]]
+        assert "echo other-tool" in commands
+        assert any("snyk_secure_at_inception" in c for c in commands)
+
+    def test_invalid_toml_raises_value_error(self, tmp_path, snyk_codex_hooks_source):
+        target = tmp_path / "bad.toml"
+        target.write_text("this is not [valid toml = \n")
+        with pytest.raises(ValueError, match="Invalid TOML"):
+            merge_codex_config(str(target), snyk_codex_hooks_source)
+
+
+class TestUnmergeCodexConfig:
+    """unmerge_codex_config removes Snyk entries while preserving user content."""
+
+    def test_round_trip_preserves_user_content(
+        self, existing_codex_target, snyk_codex_hooks_source, snyk_codex_mcp_source
+    ):
+        merge_codex_config(existing_codex_target, snyk_codex_hooks_source)
+        merge_codex_config(existing_codex_target, snyk_codex_mcp_source)
+        unmerge_codex_config(existing_codex_target, snyk_codex_mcp_source)
+        unmerge_codex_config(existing_codex_target, snyk_codex_hooks_source)
+        data = _read_toml(existing_codex_target)
+        assert data == {
+            "model": "gpt-5",
+            "features": {"my_other_flag": True},
+            "mcp_servers": {"GitHub": {"command": "gh", "args": ["mcp"]}},
+        }
+
+    def test_removes_target_file_when_only_snyk_entries_present(
+        self, tmp_path, snyk_codex_hooks_source
+    ):
+        target = str(tmp_path / "config.toml")
+        merge_codex_config(target, snyk_codex_hooks_source)
+        unmerge_codex_config(target, snyk_codex_hooks_source)
+        # Empty result file is removed entirely (not left as a stub)
+        assert not os.path.exists(target)
+
+    def test_idempotent_when_already_unmerged(self, existing_codex_target, snyk_codex_hooks_source):
+        unmerge_codex_config(existing_codex_target, snyk_codex_hooks_source)
+        unmerge_codex_config(existing_codex_target, snyk_codex_hooks_source)
+        # User content untouched after a no-op double unmerge
+        data = _read_toml(existing_codex_target)
+        assert data["model"] == "gpt-5"
+
+    def test_noop_for_missing_target(self, tmp_path, snyk_codex_hooks_source):
+        target = str(tmp_path / "absent.toml")
+        unmerge_codex_config(target, snyk_codex_hooks_source)
+        assert not os.path.exists(target)
+
+    def test_preserves_hook_entries_we_did_not_install(
+        self, existing_codex_target, snyk_codex_hooks_source
+    ):
+        merge_codex_config(existing_codex_target, snyk_codex_hooks_source)
+        # Manually add an unrelated hook under the same matcher
+        data = _read_toml(existing_codex_target)
+        data["hooks"]["PostToolUse"][0]["hooks"].append(
+            {"type": "command", "command": "echo my-own-hook"}
+        )
+        _write_toml(existing_codex_target, data)
+        # Unmerge: ours should be removed, the user's preserved
+        unmerge_codex_config(existing_codex_target, snyk_codex_hooks_source)
+        data = _read_toml(existing_codex_target)
+        commands = [h["command"] for h in data["hooks"]["PostToolUse"][0]["hooks"]]
+        assert commands == ["echo my-own-hook"]
+
+
+class TestVerifyCodexConfig:
+    """verify_codex_config exits 1 on missing entries; returns silently on success."""
+
+    def test_passes_after_merge(self, existing_codex_target, snyk_codex_hooks_source):
+        merge_codex_config(existing_codex_target, snyk_codex_hooks_source)
+        verify_codex_config(existing_codex_target, snyk_codex_hooks_source)  # no SystemExit
+
+    def test_fails_when_features_flag_missing(self, tmp_path, snyk_codex_hooks_source):
+        target = str(tmp_path / "config.toml")
+        with pytest.raises(SystemExit) as exc_info:
+            verify_codex_config(target, snyk_codex_hooks_source)
+        assert exc_info.value.code == 1
+
+    def test_fails_when_hook_event_missing(self, write_toml, snyk_codex_hooks_source, capsys):
+        target = write_toml("config.toml", "[features]\nhooks = true\n")
+        with pytest.raises(SystemExit):
+            verify_codex_config(target, snyk_codex_hooks_source)
+        err = capsys.readouterr().err
+        assert "SessionStart" in err
+
+    def test_fails_when_mcp_server_missing(self, tmp_path, snyk_codex_mcp_source):
+        target = str(tmp_path / "config.toml")
+        with pytest.raises(SystemExit) as exc_info:
+            verify_codex_config(target, snyk_codex_mcp_source)
+        assert exc_info.value.code == 1
+
+    def test_fails_when_hook_command_missing(self, write_toml, snyk_codex_hooks_source, capsys):
+        # Same matcher group exists but with the wrong command.
+        target = write_toml(
+            "config.toml",
+            """
+[features]
+hooks = true
+
+[[hooks.SessionStart]]
+[[hooks.SessionStart.hooks]]
+type = "command"
+command = "echo wrong"
+
+[[hooks.PostToolUse]]
+matcher = "^(apply_patch|Edit|Write)$"
+[[hooks.PostToolUse.hooks]]
+type = "command"
+command = "echo wrong"
+
+[[hooks.Stop]]
+[[hooks.Stop.hooks]]
+type = "command"
+command = "echo wrong"
+""",
+        )
+        with pytest.raises(SystemExit):
+            verify_codex_config(target, snyk_codex_hooks_source)
+        err = capsys.readouterr().err
+        assert "snyk_secure_at_inception" in err
