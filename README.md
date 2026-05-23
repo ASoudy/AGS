@@ -12,7 +12,7 @@ The workspace is organized as follows:
 *   **`.agents/skills/`**: Core agent skills installed locally in the workspace (e.g., `find-skills`, `create-readme`).
 *   **`claude_skills_libraries/`**: Cloned repositories of the **Top 8 Claude Skills for Entrepreneurs, Startup Founders, and Solopreneurs** (based on Snyk's curation).
 *   **`my_skills_reference/`**: Curated lists and indexes categorized for quick developer reference.
-*   **`AGAS/`** *(Git Ignored)*: A local copy of the Awesome Skills repository (`antigravity-awesome-skills`) used as a primary source for the personal reference index.
+*   **`AGAS/`**: A local hardcopy of the Awesome Skills repository (`antigravity-awesome-skills`), tracked directly in this repository for offline resilience and backup.
 
 ---
 
@@ -43,8 +43,8 @@ The [`claude_skills_libraries/`](claude_skills_libraries/) directory tracks reco
 *   **Anthropic Skill Creator**: Meta-skill to author your own standard agent skills.
 *   **Snyk Fix**: Automated vulnerability scanning and code remediation.
 
-> [!IMPORTANT]
-> The libraries in `claude_skills_libraries/` are tracked as embedded repositories (gitlinks) to preserve their respective git configurations while remaining easily referenceable.
+> [!NOTE]
+> The libraries in `claude_skills_libraries/` are now tracked directly as local hardcopies (rather than submodules/gitlinks) for complete offline independence and backup resilience.
 
 ---
 
